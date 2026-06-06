@@ -1,7 +1,10 @@
+use crate::utils;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 
 #[derive(Default, Clone)]
@@ -21,9 +24,8 @@ pub struct ImagingState {
     pub dest: String,
     pub running: bool,
     pub progress: ImagingProgress,
-    pub worker: Option<thread::JoinHandle<()>>,
     pub rx: Option<mpsc::Receiver<ImagingProgress>>,
-    pub tx: Option<mpsc::Sender<ImagingProgress>>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl ImagingState {
@@ -31,12 +33,13 @@ impl ImagingState {
         let source = self.source.clone();
         let dest = self.dest.clone();
         let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
         self.rx = Some(rx);
-        self.tx = Some(tx.clone());
         self.running = true;
 
-        let handle = thread::spawn(move || {
-            let src = match OpenOptions::new().read(true).open(&source) {
+        thread::spawn(move || {
+            let mut src = match OpenOptions::new().read(true).open(&source) {
                 Ok(f) => f,
                 Err(e) => {
                     tx.send(ImagingProgress {
@@ -62,36 +65,25 @@ impl ImagingState {
                 }
             };
 
-            let total = match src.metadata() {
-                Ok(m) => m.len(),
-                Err(_) => {
-                    // For raw devices, try to determine size via seek
-                    let mut s = src;
-                    let len = s.seek(SeekFrom::End(0)).unwrap_or(0);
-                    let _ = s.seek(SeekFrom::Start(0));
-                    len
-                }
-            };
-
-            let mut src = match OpenOptions::new().read(true).open(&source) {
-                Ok(f) => f,
-                Err(e) => {
-                    tx.send(ImagingProgress {
-                        bytes_copied: 0, total_bytes: total, speed_bps: 0.0,
-                        sha256_digest: String::new(), done: true,
-                        error: Some(format!("Cannot reopen source: {e}")),
-                        verified: None,
-                    }).ok();
-                    return;
-                }
-            };
+            let total = src.seek(SeekFrom::End(0)).unwrap_or(0);
+            let _ = src.seek(SeekFrom::Start(0));
 
             let mut hasher = Sha256::new();
-            let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
+            let mut buffer = vec![0u8; 1024 * 1024];
             let mut copied: u64 = 0;
             let start_time = std::time::Instant::now();
 
             loop {
+                if cancel.load(Ordering::Relaxed) {
+                    tx.send(ImagingProgress {
+                        bytes_copied: copied, total_bytes: total, speed_bps: 0.0,
+                        sha256_digest: String::new(), done: true,
+                        error: Some("Cancelled by user".into()),
+                        verified: None,
+                    }).ok();
+                    return;
+                }
+
                 match src.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -134,61 +126,52 @@ impl ImagingState {
                 sha256_digest: hash, done: true, error: None, verified: None,
             }).ok();
         });
-
-        self.worker = Some(handle);
     }
 
     pub fn verify(&mut self) {
         let source = self.source.clone();
         let dest = self.dest.clone();
-        let tx = self.tx.clone();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.running = true;
 
-        if let Some(tx) = tx {
-            thread::spawn(move || {
-                let hash_src = || -> Option<String> {
-                    let mut f = OpenOptions::new().read(true).open(&source).ok()?;
-                    let mut h = Sha256::new();
-                    let mut buf = vec![0u8; 1024 * 1024];
-                    loop {
-                        match f.read(&mut buf).ok()? {
-                            0 => break,
-                            n => h.update(&buf[..n]),
-                        }
+        thread::spawn(move || {
+            let hash_file = |path: &str| -> Option<String> {
+                let mut f = OpenOptions::new().read(true).open(path).ok()?;
+                let mut h = Sha256::new();
+                let mut buf = vec![0u8; 1024 * 1024];
+                loop {
+                    match f.read(&mut buf).ok()? {
+                        0 => break,
+                        n => h.update(&buf[..n]),
                     }
-                    Some(format!("{:x}", h.finalize()))
-                };
-
-                let hash_dst = || -> Option<String> {
-                    let mut f = OpenOptions::new().read(true).open(&dest).ok()?;
-                    let mut h = Sha256::new();
-                    let mut buf = vec![0u8; 1024 * 1024];
-                    loop {
-                        match f.read(&mut buf).ok()? {
-                            0 => break,
-                            n => h.update(&buf[..n]),
-                        }
-                    }
-                    Some(format!("{:x}", h.finalize()))
-                };
-
-                let hs = hash_src();
-                let hd = hash_dst();
-
-                if let (Some(s), Some(d)) = (&hs, &hd) {
-                    tx.send(ImagingProgress {
-                        bytes_copied: 0, total_bytes: 0, speed_bps: 0.0,
-                        sha256_digest: format!("Src: {s}\nDst: {d}"), done: false,
-                        error: None, verified: Some(s == d),
-                    }).ok();
-                } else {
-                    tx.send(ImagingProgress {
-                        bytes_copied: 0, total_bytes: 0, speed_bps: 0.0,
-                        sha256_digest: String::new(), done: false,
-                        error: Some("Verification failed — cannot read one or both files".into()),
-                        verified: None,
-                    }).ok();
                 }
-            });
+                Some(format!("{:x}", h.finalize()))
+            };
+
+            let hs = hash_file(&source);
+            let hd = hash_file(&dest);
+
+            if let (Some(s), Some(d)) = (&hs, &hd) {
+                tx.send(ImagingProgress {
+                    bytes_copied: 0, total_bytes: 0, speed_bps: 0.0,
+                    sha256_digest: format!("Src: {s}\nDst: {d}"), done: true,
+                    error: None, verified: Some(s == d),
+                }).ok();
+            } else {
+                tx.send(ImagingProgress {
+                    bytes_copied: 0, total_bytes: 0, speed_bps: 0.0,
+                    sha256_digest: String::new(), done: true,
+                    error: Some("Verification failed — cannot read one or both files".into()),
+                    verified: None,
+                }).ok();
+            }
+        });
+    }
+
+    pub fn cancel(&self) {
+        if let Some(ref c) = self.cancel {
+            c.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -213,11 +196,11 @@ pub fn imaging_ui(state: &mut ImagingState, ctx: &egui::Context, ui: &mut egui::
         }
     } else {
         if ui.button("⏹ Stop").clicked() {
+            state.cancel();
             state.running = false;
         }
     }
 
-    // Check for progress updates
     if let Some(rx) = &state.rx {
         while let Ok(p) = rx.try_recv() {
             state.progress = p;
@@ -233,15 +216,14 @@ pub fn imaging_ui(state: &mut ImagingState, ctx: &egui::Context, ui: &mut egui::
         let fraction = progress.bytes_copied as f64 / progress.total_bytes as f64;
         ui.add(egui::ProgressBar::new(fraction as f32).text(format!(
             "{:.1}% — {}/{}", fraction * 100.0,
-            format_size(progress.bytes_copied), format_size(progress.total_bytes)
+            utils::format_size(progress.bytes_copied), utils::format_size(progress.total_bytes)
         )));
 
         if progress.speed_bps > 0.0 {
-            let eta_secs = if progress.speed_bps > 0.0 {
-                (progress.total_bytes - progress.bytes_copied) as f64 / progress.speed_bps
-            } else { 0.0 };
+            let remaining = progress.total_bytes.saturating_sub(progress.bytes_copied);
+            let eta_secs = (remaining as f64 / progress.speed_bps) as u64;
             ui.label(format!("Speed: {}/s  ETA: {}",
-                format_size(progress.speed_bps as u64), format_duration(eta_secs as u64)));
+                utils::format_size(progress.speed_bps as u64), utils::format_duration(eta_secs)));
         }
     }
 
@@ -260,32 +242,10 @@ pub fn imaging_ui(state: &mut ImagingState, ctx: &egui::Context, ui: &mut egui::
     if !state.running && progress.done && progress.bytes_copied > 0 {
         if ui.button("🔍 Verify SHA-256").clicked() {
             state.verify();
-            state.running = true;
         }
     }
 
     if let Some(ref e) = progress.error {
         ui.colored_label(egui::Color32::RED, e);
-    }
-}
-
-fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    format!("{:.1} {}", size, UNITS[unit])
-}
-
-fn format_duration(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     }
 }

@@ -4,6 +4,7 @@ mod git_recovery;
 mod hex_viewer;
 mod imager;
 mod partition_scanner;
+mod utils;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -28,7 +29,7 @@ struct DiskDoctor {
 impl Default for DiskDoctor {
     fn default() -> Self {
         Self {
-            tab: Tab::GitRecovery,
+            tab: Tab::DiskInfo,
             disk_info: disk_info::DiskInfoState::default(),
             imaging: imager::ImagingState::default(),
             partition_scan: partition_scanner::PartitionScanState::default(),
@@ -41,9 +42,8 @@ impl Default for DiskDoctor {
 
 impl eframe::App for DiskDoctor {
     fn ui(&mut self, _: &mut egui::Ui, _: &mut eframe::Frame) {}
-
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::Panel::top("tab_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("🩺 Disk Doctor");
                 ui.separator();

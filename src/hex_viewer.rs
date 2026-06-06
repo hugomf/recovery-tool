@@ -1,7 +1,7 @@
+use crate::utils;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 
-#[derive(Default)]
 pub struct HexViewerState {
     pub path: String,
     pub data: Vec<u8>,
@@ -11,6 +11,21 @@ pub struct HexViewerState {
     pub error: Option<String>,
     pub go_to_offset: String,
     pub bytes_per_row: usize,
+}
+
+impl Default for HexViewerState {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            data: Vec::new(),
+            offset: 0,
+            file_size: 0,
+            loaded: false,
+            error: None,
+            go_to_offset: String::new(),
+            bytes_per_row: 16,
+        }
+    }
 }
 
 impl HexViewerState {
@@ -31,10 +46,19 @@ impl HexViewerState {
         self.file_size = file.seek(SeekFrom::End(0)).unwrap_or(0);
         let _ = file.seek(SeekFrom::Start(self.offset));
 
+        // Round up to 64KB but don't exceed file size
         let read_size = (64 * 1024).min(self.file_size.saturating_sub(self.offset)) as usize;
+        if read_size == 0 {
+            self.data = Vec::new();
+            self.loaded = true;
+            self.error = None;
+            return;
+        }
+
         let mut buffer = vec![0u8; read_size];
-        match file.read_exact(&mut buffer) {
-            Ok(_) => {
+        match file.read(&mut buffer) {
+            Ok(n) => {
+                buffer.truncate(n);
                 self.data = buffer;
                 self.loaded = true;
                 self.error = None;
@@ -57,7 +81,7 @@ impl HexViewerState {
     }
 }
 
-pub fn hex_viewer_ui(state: &mut HexViewerState, ctx: &egui::Context, ui: &mut egui::Ui) {
+pub fn hex_viewer_ui(state: &mut HexViewerState, _ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.heading("📝 Hex Viewer");
     ui.separator();
 
@@ -80,7 +104,7 @@ pub fn hex_viewer_ui(state: &mut HexViewerState, ctx: &egui::Context, ui: &mut e
         if ui.button("Go").clicked() {
             state.go_offset(&state.go_to_offset.clone());
         }
-        ui.label(format!("(file size: {})", format_size(state.file_size)));
+        ui.label(format!("(file size: {})", utils::format_size(state.file_size)));
     });
 
     if let Some(ref e) = state.error {
@@ -93,31 +117,26 @@ pub fn hex_viewer_ui(state: &mut HexViewerState, ctx: &egui::Context, ui: &mut e
         return;
     }
 
-    // Pagination
-    let row_height = 18.0;
-    let viewport_height = ui.available_height() - 40.0;
-    let visible_rows = (viewport_height / row_height).max(10.0) as usize;
-    let total_rows = state.data.len() / state.bytes_per_row + 1;
-    let scroll = egui::ScrollArea::vertical()
+    let bpr = state.bytes_per_row.max(1);
+    let total_rows = state.data.len().div_ceil(bpr);
+
+    egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
-        .max_height(ui.available_height());
+        .max_height(ui.available_height())
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.monospace("  Offset    ");
+                for b in 0..bpr {
+                    ui.monospace(format!("{b:02X} "));
+                }
+                ui.monospace("  ASCII");
+            });
 
-    scroll.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.monospace("  Offset    ");
-            for b in 0..state.bytes_per_row {
-                ui.monospace(format!("{b:02X} "));
-            }
-            ui.monospace("  ASCII");
-        });
+            ui.separator();
 
-        let ascii_offset = 12 + state.bytes_per_row * 3;
-        ui.separator();
-
-        egui::ScrollArea::vertical().id_source("hex_scroll").show(ui, |ui| {
             for row in 0..total_rows {
-                let start = row * state.bytes_per_row;
-                let end = (start + state.bytes_per_row).min(state.data.len());
+                let start = row * bpr;
+                let end = (start + bpr).min(state.data.len());
                 let abs_offset = state.offset + start as u64;
 
                 let ascii: String = state.data[start..end].iter()
@@ -126,11 +145,10 @@ pub fn hex_viewer_ui(state: &mut HexViewerState, ctx: &egui::Context, ui: &mut e
 
                 ui.horizontal(|ui| {
                     ui.monospace(format!("  0x{abs_offset:08X}  "));
-                    for b in &state.data[start..end] {
+                    for &b in &state.data[start..end] {
                         ui.monospace(format!("{b:02X} "));
                     }
-                    // Pad remaining space
-                    let remaining = state.bytes_per_row - (end - start);
+                    let remaining = bpr - (end - start);
                     for _ in 0..remaining {
                         ui.monospace("   ");
                     }
@@ -138,9 +156,8 @@ pub fn hex_viewer_ui(state: &mut HexViewerState, ctx: &egui::Context, ui: &mut e
                 });
             }
         });
-    });
 
-    // Navigation controls
+    // Navigation
     ui.separator();
     ui.horizontal(|ui| {
         if state.offset > 0 {
@@ -156,15 +173,4 @@ pub fn hex_viewer_ui(state: &mut HexViewerState, ctx: &egui::Context, ui: &mut e
             }
         }
     });
-}
-
-fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    format!("{:.1} {}", size, UNITS[unit])
 }

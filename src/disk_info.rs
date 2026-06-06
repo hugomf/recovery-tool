@@ -2,11 +2,10 @@ use std::process::Command;
 
 #[derive(Clone)]
 pub struct DiskEntry {
-    pub name: String,
     pub identifier: String,
     pub size: String,
     pub internal: bool,
-    pub details: Vec<(String, String)>,
+    pub details: Vec<String>,
 }
 
 #[derive(Default)]
@@ -31,24 +30,27 @@ fn parse_diskutil_list() -> Result<Vec<DiskEntry>, String> {
                 disks.push(d);
             }
             let is_internal = line.contains("internal");
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            let name = parts.first().unwrap_or(&"").trim_start_matches("/dev/");
+            let identifier = line.split_whitespace().next().unwrap_or("").to_string();
             current = Some(DiskEntry {
-                name: name.to_string(),
-                identifier: parts.first().unwrap_or(&"").to_string(),
+                identifier,
                 size: String::new(),
                 internal: is_internal,
-                details: Vec::new(),
+                details: vec![line.to_string()],
             });
         } else if let Some(ref mut d) = current {
-            if line.contains("GUID_partition_scheme") || line.contains("FDisk_partition_scheme") || line.contains("Apple_partition_scheme") {
+            d.details.push(line.to_string());
+            if !line.contains("Scheme") && !line.contains("Container") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    d.size = parts[parts.len() - 2].to_string();
+                if parts.len() >= 3 && parts[parts.len() - 1].starts_with("disk") {
+                    // This is a partition line: extract size if present
+                    let end = parts.len() - 1;
+                    for i in (1..end).rev() {
+                        if parts[i].contains('.') && (parts[i].ends_with('B') || parts[i].ends_with("KB") || parts[i].ends_with("MB") || parts[i].ends_with("GB") || parts[i].ends_with("TB")) {
+                            d.size = parts[i].to_string();
+                            break;
+                        }
+                    }
                 }
-            }
-            if !line.trim().is_empty() {
-                d.details.push(("".into(), line.trim().to_string()));
             }
         }
     }
@@ -56,7 +58,51 @@ fn parse_diskutil_list() -> Result<Vec<DiskEntry>, String> {
         disks.push(d);
     }
 
+    // Fetch sizes via diskutil info for each disk
+    for disk in &mut disks {
+        if let Ok(out) = Command::new("diskutil")
+            .args(["info", "-plist", &disk.identifier])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(pos) = text.find("<key>TotalSize</key>") {
+                let rest = &text[pos..];
+                if let Some(val_start) = rest.find("<integer>") {
+                    let val_start = val_start + "<integer>".len();
+                    if let Some(val_end) = rest[val_start..].find("</integer>") {
+                        let size_str = &rest[val_start..val_start + val_end];
+                        if let Ok(bytes) = size_str.parse::<u64>() {
+                            disk.size = format_size(bytes);
+                        }
+                    }
+                }
+            }
+            if let Some(pos) = text.find("<key>SMARTStatus</key>") {
+                let rest = &text[pos..];
+                if let Some(val_start) = rest.find("<string>") {
+                    let val_start = val_start + "<string>".len();
+                    if let Some(val_end) = rest[val_start..].find("</string>") {
+                        let smart = &rest[val_start..val_start + val_end];
+                        disk.details.push(format!("SMART: {smart}"));
+                    }
+                }
+            }
+        }
+    }
+
     Ok(disks)
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000_000 {
+        format!("{:.1} TB", bytes as f64 / 1_000_000_000_000.0)
+    } else if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 pub fn fetch_disk_info(state: &mut DiskInfoState) {
@@ -100,19 +146,18 @@ pub fn disk_info_ui(state: &mut DiskInfoState, ui: &mut egui::Ui) {
         return;
     }
 
-    egui::Panel::left("disk_tree")
-        .resizable(true)
-        .default_width(200.0)
-        .show_inside(ui, |ui| {
+    ui.horizontal(|ui| {
+        ui.scope(|ui| {
+            ui.set_min_width(200.0);
             ui.label("Devices:");
             ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(ui.available_height()).show(ui, |ui| {
                 for (i, disk) in state.disks.iter().enumerate() {
                     let label = format!(
                         "{} {} {}",
                         if disk.internal { "🖥" } else { "💾" },
-                        disk.name,
+                        disk.identifier,
                         disk.size
                     );
                     if ui.selectable_label(state.selected_index == i, &label).clicked() {
@@ -122,34 +167,20 @@ pub fn disk_info_ui(state: &mut DiskInfoState, ui: &mut egui::Ui) {
             });
         });
 
-    egui::CentralPanel::default().show_inside(ui, |ui| {
-        if let Some(disk) = state.disks.get(state.selected_index) {
-            ui.strong(&disk.identifier);
-            ui.label(format!("Size: {}", disk.size));
-            ui.label(if disk.internal { "Internal" } else { "External" });
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (_, line) in &disk.details {
-                    ui.monospace(line);
-                }
-            });
+        ui.separator();
 
-            if ui.button("📋 Copy disk info").clicked() {
-                let mut info = format!("Device: {}\nSize: {}\n", disk.identifier, disk.size);
-                for (_, line) in &disk.details {
-                    info.push_str(line);
-                    info.push('\n');
-                }
-                if let Ok(mut child) = std::process::Command::new("pbcopy")
-                    .stdin(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        use std::io::Write;
-                        let _ = stdin.write_all(info.as_bytes());
+        if let Some(disk) = state.disks.get(state.selected_index) {
+            ui.vertical(|ui| {
+                ui.strong(&disk.identifier);
+                ui.label(format!("Size: {}", disk.size));
+                ui.label(if disk.internal { "Internal" } else { "External" });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for line in &disk.details {
+                        ui.monospace(line);
                     }
-                }
-            }
+                });
+            });
         }
     });
 }

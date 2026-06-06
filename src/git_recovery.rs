@@ -62,19 +62,31 @@ fn run_scan(tx: mpsc::Sender<ScanEvent>) {
         format!("{home}/.zsh_history"),
     ] {
         if let Ok(content) = std::fs::read_to_string(hist_file) {
-            for line in content.lines() {
+            for raw_line in content.lines() {
+                // Strip zsh extended history prefix: ": 1700000000:0;command"
+                let line = if raw_line.starts_with(": ") {
+                    raw_line.find(";").map_or(raw_line, |semi| &raw_line[semi + 1..])
+                } else {
+                    raw_line
+                };
+
                 if let Some(url_start) = line.find("git clone ") {
                     let rest = &line[url_start + 10..];
-                    let url = rest.split_whitespace().next().unwrap_or("");
-                    let url = url.trim_matches('\'');
-                    let url = url.trim_matches('"');
-                    if !url.is_empty() && !seen_remotes.contains(&url.to_string()) {
-                        seen_remotes.push(url.to_string());
-                        let name = url.rsplit('/').next().unwrap_or(url)
-                            .trim_end_matches(".git");
+                    let url = rest.split_whitespace()
+                        .skip_while(|t| t.starts_with('-'))
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .to_string();
+                    if !url.is_empty() && !seen_remotes.contains(&url) {
+                        seen_remotes.push(url.clone());
+                        let name = url.rsplit('/').next().unwrap_or(&url)
+                            .trim_end_matches(".git")
+                            .to_string();
                         tx.send(ScanEvent::FoundRepo(RecoveredRepo {
-                            name: name.to_string(),
-                            remote: url.to_string(),
+                            name,
+                            remote: url,
                             source: "shell history".into(),
                             local_path: None,
                         })).ok();

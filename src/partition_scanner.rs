@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 
 const SECTOR_SIZE: u64 = 512;
+const MAX_SCAN_SECTORS: u64 = 100_000; // ~50MB — covers all common partition layouts
 
 struct PartSig {
     name: &'static str,
@@ -27,7 +28,6 @@ pub struct FoundPartition {
     pub offset: u64,
     pub sector: u64,
     pub sig_name: String,
-    pub size: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -99,7 +99,7 @@ impl PartitionScanState {
                                             offset,
                                             sector: sector + s,
                                             sig_name: sig.name.to_string(),
-                                            size: None,
+
                                         });
                                     }
                                 }
@@ -117,7 +117,7 @@ impl PartitionScanState {
                             error: None,
                         }).ok();
 
-                        if scanned >= 100_000 { // Scan first ~50MB for partitions
+                        if scanned >= MAX_SCAN_SECTORS {
                             break;
                         }
                     }
@@ -170,15 +170,12 @@ pub fn partition_scan_ui(state: &mut PartitionScanState, ctx: &egui::Context, ui
 
     let p = &state.progress;
     if state.scanning || p.total_sectors > 0 {
-        if p.total_sectors > 0 {
-            let frac = (p.sectors_scanned as f64 / p.total_sectors as f64).min(1.0) as f32;
+        let limit = p.total_sectors.min(MAX_SCAN_SECTORS);
+        if limit > 0 {
+            let frac = (p.sectors_scanned as f64 / limit as f64).min(1.0) as f32;
             ui.add(egui::ProgressBar::new(frac).text(format!(
-                "Scanning... {} sectors / {}",
-                p.sectors_scanned, if p.total_sectors > 1_000_000 {
-                    format!("{:.1}M", p.total_sectors as f64 / 1_000_000.0)
-                } else {
-                    p.total_sectors.to_string()
-                }
+                "Scanning... {} sectors / {} (limit: {}M)",
+                p.sectors_scanned, limit, limit / 1_000_000
             )));
         } else {
             ui.spinner();
