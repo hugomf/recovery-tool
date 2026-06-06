@@ -1,6 +1,9 @@
-use crate::utils;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
+
+use crate::utils::format_size;
+
+const PAGE_SIZE: u64 = 64 * 1024;
 
 pub struct HexViewerState {
     pub path: String,
@@ -44,18 +47,14 @@ impl HexViewerState {
         };
 
         self.file_size = file.seek(SeekFrom::End(0)).unwrap_or(0);
-        let _ = file.seek(SeekFrom::Start(self.offset));
-
-        // Round up to 64KB but don't exceed file size
-        let read_size = (64 * 1024).min(self.file_size.saturating_sub(self.offset)) as usize;
-        if read_size == 0 {
-            self.data = Vec::new();
-            self.loaded = true;
-            self.error = None;
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            self.error = Some("Seek failed".into());
             return;
         }
 
+        let read_size = PAGE_SIZE.min(self.file_size.saturating_sub(self.offset)) as usize;
         let mut buffer = vec![0u8; read_size];
+
         match file.read(&mut buffer) {
             Ok(n) => {
                 buffer.truncate(n);
@@ -76,7 +75,7 @@ impl HexViewerState {
         } else {
             trimmed.parse::<u64>().unwrap_or(0)
         };
-        self.offset = offset;
+        self.offset = offset.min(self.file_size.saturating_sub(1));
         self.load();
     }
 }
@@ -87,8 +86,9 @@ pub fn hex_viewer_ui(state: &mut HexViewerState, _ctx: &egui::Context, ui: &mut 
 
     ui.horizontal(|ui| {
         ui.label("File:");
-        ui.text_edit_singleline(&mut state.path);
-        if ui.button("Open").clicked() {
+        let response = ui.text_edit_singleline(&mut state.path);
+        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.button("Open").clicked() || enter {
             state.offset = 0;
             state.loaded = false;
             state.go_to_offset.clear();
@@ -97,55 +97,75 @@ pub fn hex_viewer_ui(state: &mut HexViewerState, _ctx: &egui::Context, ui: &mut 
     });
 
     ui.horizontal(|ui| {
-        ui.label("Go to:");
-        if ui.text_edit_singleline(&mut state.go_to_offset).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            state.go_offset(&state.go_to_offset.clone());
+        ui.label("Go to offset:");
+        let response = ui.text_edit_singleline(&mut state.go_to_offset);
+        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.button("Go").clicked() || enter {
+            let s = state.go_to_offset.clone();
+            state.go_offset(&s);
         }
-        if ui.button("Go").clicked() {
-            state.go_offset(&state.go_to_offset.clone());
+
+        if state.file_size > 0 {
+            ui.separator();
+            ui.label(format!("File size: {}", format_size(state.file_size)));
+            ui.label(format!(
+                "  Page: 0x{:X}–0x{:X}",
+                state.offset,
+                (state.offset + state.data.len() as u64).min(state.file_size)
+            ));
         }
-        ui.label(format!("(file size: {})", utils::format_size(state.file_size)));
+
+        ui.separator();
+        ui.label("Width:");
+        for &w in &[8usize, 16, 32] {
+            if ui.selectable_label(state.bytes_per_row == w, w.to_string()).clicked() {
+                state.bytes_per_row = w;
+            }
+        }
     });
 
-    if let Some(ref e) = state.error {
-        ui.colored_label(egui::Color32::RED, e);
+    if let Some(ref e) = state.error.clone() {
+        ui.colored_label(egui::Color32::RED, format!("⚠ {e}"));
         return;
     }
 
     if !state.loaded || state.data.is_empty() {
-        ui.label("Open a file or device to view hex.");
+        ui.vertical_centered(|ui| {
+            ui.add_space(30.0);
+            ui.label("Open a file or device path (e.g. /dev/disk0) to view hex.");
+        });
         return;
     }
 
     let bpr = state.bytes_per_row.max(1);
-    let total_rows = state.data.len().div_ceil(bpr);
+    let total_rows = (state.data.len() + bpr - 1) / bpr;
 
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
-        .max_height(ui.available_height())
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.monospace("  Offset    ");
+                ui.monospace(format!("{:12}", "Offset"));
                 for b in 0..bpr {
                     ui.monospace(format!("{b:02X} "));
                 }
                 ui.monospace("  ASCII");
             });
-
             ui.separator();
 
             for row in 0..total_rows {
                 let start = row * bpr;
                 let end = (start + bpr).min(state.data.len());
                 let abs_offset = state.offset + start as u64;
+                let row_bytes = &state.data[start..end];
 
-                let ascii: String = state.data[start..end].iter()
+                let ascii: String = row_bytes
+                    .iter()
                     .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
                     .collect();
 
                 ui.horizontal(|ui| {
-                    ui.monospace(format!("  0x{abs_offset:08X}  "));
-                    for &b in &state.data[start..end] {
+                    ui.monospace(format!("0x{abs_offset:08X}  "));
+                    for b in row_bytes {
                         ui.monospace(format!("{b:02X} "));
                     }
                     let remaining = bpr - (end - start);
@@ -157,20 +177,24 @@ pub fn hex_viewer_ui(state: &mut HexViewerState, _ctx: &egui::Context, ui: &mut 
             }
         });
 
-    // Navigation
     ui.separator();
     ui.horizontal(|ui| {
-        if state.offset > 0 {
-            if ui.button("⬅ Prev Page").clicked() {
-                state.offset = state.offset.saturating_sub(64 * 1024);
-                state.load();
-            }
+        let at_start = state.offset == 0;
+        if ui.add_enabled(!at_start, egui::Button::new("⬅ Prev")).clicked() {
+            state.offset = state.offset.saturating_sub(PAGE_SIZE);
+            state.load();
         }
-        if state.offset + 64 * 1024 < state.file_size {
-            if ui.button("Next Page ➡").clicked() {
-                state.offset = (state.offset + 64 * 1024).min(state.file_size.saturating_sub(1));
-                state.load();
-            }
+
+        let at_end = state.offset + PAGE_SIZE >= state.file_size;
+        if ui.add_enabled(!at_end, egui::Button::new("Next ➡")).clicked() {
+            state.offset = (state.offset + PAGE_SIZE).min(state.file_size.saturating_sub(1));
+            state.load();
+        }
+
+        if state.file_size > 0 {
+            let page = state.offset / PAGE_SIZE + 1;
+            let total_pages = (state.file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+            ui.label(format!("Page {page}/{total_pages}"));
         }
     });
 }
