@@ -47,32 +47,30 @@ impl eframe::App for DiskDoctor {
             ui.horizontal(|ui| {
                 ui.heading("🩺 Disk Doctor");
                 ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::DiskInfo, "💻 Disk Info");
-                ui.selectable_value(&mut self.tab, Tab::Imaging, "💾 Imaging");
+                ui.selectable_value(&mut self.tab, Tab::DiskInfo,      "💻 Disk Info");
+                ui.selectable_value(&mut self.tab, Tab::Imaging,       "💾 Imaging");
                 ui.selectable_value(&mut self.tab, Tab::PartitionScan, "🔍 Partition Scan");
-                ui.selectable_value(&mut self.tab, Tab::FileCarver, "🔧 File Carver");
-                ui.selectable_value(&mut self.tab, Tab::HexViewer, "📝 Hex Viewer");
-                ui.selectable_value(&mut self.tab, Tab::GitRecovery, "🔗 Git Recovery");
+                ui.selectable_value(&mut self.tab, Tab::FileCarver,    "🔧 File Carver");
+                ui.selectable_value(&mut self.tab, Tab::HexViewer,     "📝 Hex Viewer");
+                ui.selectable_value(&mut self.tab, Tab::GitRecovery,   "🔗 Git Recovery");
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.tab {
-                Tab::DiskInfo => disk_info::disk_info_ui(&mut self.disk_info, ui),
-                Tab::Imaging => imager::imaging_ui(&mut self.imaging, ctx, ui),
+                Tab::DiskInfo      => disk_info::disk_info_ui(&mut self.disk_info, ui),
+                Tab::Imaging       => imager::imaging_ui(&mut self.imaging, ctx, ui),
                 Tab::PartitionScan => partition_scanner::partition_scan_ui(&mut self.partition_scan, ctx, ui),
-                Tab::FileCarver => carver::carver_ui(&mut self.carver, ctx, ui),
-                Tab::HexViewer => hex_viewer::hex_viewer_ui(&mut self.hex_viewer, ctx, ui),
-                Tab::GitRecovery => git_recovery::git_recovery_ui(&mut self.git_recovery, ctx, ui),
+                Tab::FileCarver    => carver::carver_ui(&mut self.carver, ctx, ui),
+                Tab::HexViewer     => hex_viewer::hex_viewer_ui(&mut self.hex_viewer, ctx, ui),
+                Tab::GitRecovery   => git_recovery::git_recovery_ui(&mut self.git_recovery, ctx, ui),
             }
         });
     }
 }
 
 fn main() -> eframe::Result<()> {
-    // Allow running from terminal with sudo
     println!("Disk Doctor — Forensic Recovery Toolkit");
-    println!("Source: https://github.com/your-org/disk-doctor");
 
     eframe::run_native(
         "Disk Doctor",
