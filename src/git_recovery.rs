@@ -22,73 +22,37 @@ fn run_scan(tx: mpsc::Sender<ScanEvent>) {
     let projects = format!("{home}/Projects");
     let mut seen_remotes: Vec<String> = vec![];
 
+    // --- Surviving .git dirs ---
     tx.send(ScanEvent::Progress("Scanning for surviving .git dirs...".into())).ok();
-    if let Some(out) = Command::new("find")
+    if let Ok(out) = Command::new("find")
         .args([&projects, "-maxdepth", "4", "-name", "config", "-path", "*.git/config", "-type", "f"])
-        .output().ok()
+        .output()
     {
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            if let Some(cfg) = std::fs::read_to_string(line).ok() {
-                for line2 in cfg.lines() {
-                    let line2 = line2.trim();
-                    if line2.starts_with("url = ") {
-                        let url = line2.trim_start_matches("url = ");
+        for config_path in String::from_utf8_lossy(&out.stdout).lines() {
+            let config_path = config_path.trim();
+            if config_path.is_empty() {
+                continue;
+            }
+            if let Ok(cfg) = std::fs::read_to_string(config_path) {
+                for line in cfg.lines() {
+                    let line = line.trim();
+                    if let Some(url) = line.strip_prefix("url = ") {
+                        let url = url.trim();
+                        if seen_remotes.contains(&url.to_string()) {
+                            continue;
+                        }
+                        seen_remotes.push(url.to_string());
                         let name = url.rsplit('/').next().unwrap_or(url)
                             .trim_end_matches(".git");
-                        if !seen_remotes.contains(&url.to_string()) {
-                            seen_remotes.push(url.to_string());
-                            let path = line.trim_end_matches("/.git/config")
-                                .trim_end_matches("/config")
-                                .to_string();
-                            tx.send(ScanEvent::FoundRepo(RecoveredRepo {
-                                name: name.to_string(),
-                                remote: url.to_string(),
-                                source: "surviving .git".into(),
-                                local_path: Some(path),
-                            })).ok();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    tx.send(ScanEvent::Progress("Scanning shell history...".into())).ok();
-    for hist_file in &[
-        format!("{home}/.zhistory"),
-        format!("{home}/.bash_history"),
-        format!("{home}/.zsh_history"),
-    ] {
-        if let Ok(content) = std::fs::read_to_string(hist_file) {
-            for raw_line in content.lines() {
-                // Strip zsh extended history prefix: ": 1700000000:0;command"
-                let line = if raw_line.starts_with(": ") {
-                    raw_line.find(";").map_or(raw_line, |semi| &raw_line[semi + 1..])
-                } else {
-                    raw_line
-                };
-
-                if let Some(url_start) = line.find("git clone ") {
-                    let rest = &line[url_start + 10..];
-                    let url = rest.split_whitespace()
-                        .skip_while(|t| t.starts_with('-'))
-                        .next()
-                        .unwrap_or("")
-                        .trim_matches('\'')
-                        .trim_matches('"')
-                        .to_string();
-                    if !url.is_empty() && !seen_remotes.contains(&url) {
-                        seen_remotes.push(url.clone());
-                        let name = url.rsplit('/').next().unwrap_or(&url)
-                            .trim_end_matches(".git")
+                        let local = config_path
+                            .trim_end_matches("/.git/config")
+                            .trim_end_matches("/config")
                             .to_string();
                         tx.send(ScanEvent::FoundRepo(RecoveredRepo {
-                            name,
-                            remote: url,
-                            source: "shell history".into(),
-                            local_path: None,
+                            name: name.to_string(),
+                            remote: url.to_string(),
+                            source: "local .git".into(),
+                            local_path: Some(local),
                         })).ok();
                     }
                 }
@@ -96,6 +60,53 @@ fn run_scan(tx: mpsc::Sender<ScanEvent>) {
         }
     }
 
+    // --- Shell history ---
+    tx.send(ScanEvent::Progress("Scanning shell history...".into())).ok();
+    let hist_files = [
+        format!("{home}/.zhistory"),
+        format!("{home}/.bash_history"),
+        format!("{home}/.zsh_history"),
+    ];
+    for hist_file in &hist_files {
+        if let Ok(content) = std::fs::read_to_string(hist_file) {
+            for raw_line in content.lines() {
+                let line = if raw_line.starts_with(": ") {
+                    match raw_line.find(';') {
+                        Some(idx) => &raw_line[idx + 1..],
+                        None => raw_line,
+                    }
+                } else {
+                    raw_line
+                };
+
+                if let Some(clone_start) = line.find("git clone ") {
+                    let after_clone = &line[clone_start + 10..];
+
+                    let url = after_clone
+                        .split_whitespace()
+                        .find(|tok| !tok.starts_with('-'))
+                        .unwrap_or("")
+                        .trim_matches('\'')
+                        .trim_matches('"');
+
+                    if url.is_empty() || seen_remotes.contains(&url.to_string()) {
+                        continue;
+                    }
+                    seen_remotes.push(url.to_string());
+                    let name = url.rsplit('/').next().unwrap_or(url)
+                        .trim_end_matches(".git");
+                    tx.send(ScanEvent::FoundRepo(RecoveredRepo {
+                        name: name.to_string(),
+                        remote: url.to_string(),
+                        source: "shell history".into(),
+                        local_path: None,
+                    })).ok();
+                }
+            }
+        }
+    }
+
+    // --- gh CLI ---
     tx.send(ScanEvent::Progress("Checking gh CLI...".into())).ok();
     if let Ok(out) = Command::new("gh").args(["repo", "list", "--limit", "100"]).output() {
         if out.status.success() {
@@ -104,15 +115,16 @@ fn run_scan(tx: mpsc::Sender<ScanEvent>) {
                 if let Some(full_name) = parts.first() {
                     let name = full_name.split('/').last().unwrap_or(full_name);
                     let url = format!("https://github.com/{full_name}.git");
-                    if !seen_remotes.contains(&url) {
-                        seen_remotes.push(url.clone());
-                        tx.send(ScanEvent::FoundRepo(RecoveredRepo {
-                            name: name.to_string(),
-                            remote: url,
-                            source: "gh CLI".into(),
-                            local_path: None,
-                        })).ok();
+                    if seen_remotes.contains(&url) {
+                        continue;
                     }
+                    seen_remotes.push(url.clone());
+                    tx.send(ScanEvent::FoundRepo(RecoveredRepo {
+                        name: name.to_string(),
+                        remote: url,
+                        source: "gh CLI".into(),
+                        local_path: None,
+                    })).ok();
                 }
             }
         }
@@ -179,17 +191,21 @@ STEPS:
 5. Select partition type (EFI GPT or Intel)
 6. Select the APFS partition
 7. Choose "Other" for filesystem type
-8. Select [File Opt] → check source code types: .rs, .ts, .js, .py, .java, .kt, .swift, .go, .c, .h, .cpp, .toml, .json, .yaml, .md, .dart, .gradle, .xml, .properties
-9. Choose destination (an EXTERNAL drive — NOT the same disk)
+8. Select [File Opt] → check source code types:
+   .rs .ts .js .py .java .kt .swift .go .c .h .cpp
+   .toml .json .yaml .md .dart .gradle .xml .properties
+9. Choose destination — use an EXTERNAL drive, NOT the same disk
 10. Start recovery
 
-After recovery, you'll get thousands of files named like f1234567.rs.
-Use `file` command or grep through content to identify what you need.
+After recovery, you'll have thousands of files named like f1234567.rs.
+Use `file` or grep to identify what's worth keeping.
 "#;
 
 pub fn git_recovery_ui(state: &mut GitRecoveryState, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.heading("🔗 Git Remote Recovery");
     ui.separator();
+
+    state.update(ctx);
 
     ui.horizontal(|ui| {
         if !state.scanning {
@@ -197,13 +213,10 @@ pub fn git_recovery_ui(state: &mut GitRecoveryState, ctx: &egui::Context, ui: &m
                 state.start_scan();
             }
         } else {
-            ui.label("⏳");
-            ui.label(&state.scan_progress);
             ui.spinner();
+            ui.label(&state.scan_progress);
         }
     });
-
-    state.update(ctx);
 
     if state.scanning && state.repos.is_empty() {
         ui.vertical_centered(|ui| {
@@ -219,7 +232,7 @@ pub fn git_recovery_ui(state: &mut GitRecoveryState, ctx: &egui::Context, ui: &m
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
             ui.heading("No recoverable repos found via git/gh.");
-            ui.label("Try photorec for deep file recovery (see bottom of this tab).");
+            ui.label("Try photorec for deep file recovery (see button below).");
         });
         if ui.button("📖 Show photorec instructions").clicked() {
             state.script = Some(PHOTOREC_INSTRUCTIONS.to_string());
@@ -234,40 +247,42 @@ pub fn git_recovery_ui(state: &mut GitRecoveryState, ctx: &egui::Context, ui: &m
         let from_gh = state.repos.iter().filter(|r| r.source == "gh CLI").count();
 
         ui.horizontal(|ui| {
-            ui.label(format!("📁 with local data: {survivors}"));
-            ui.label(format!("📜 from shell history: {from_history}"));
-            ui.label(format!("🐙 from GitHub: {from_gh}"));
+            ui.label(format!("📁 local .git: {survivors}"));
+            ui.label(format!("📜 shell history: {from_history}"));
+            ui.label(format!("🐙 GitHub: {from_gh}"));
         });
         ui.separator();
 
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.label("Recoverable repositories:");
-            ui.separator();
-            for repo in &state.repos {
-                ui.horizontal(|ui| {
-                    if repo.local_path.is_some() {
-                        ui.label("✅");
-                    } else {
-                        ui.label("🔶");
-                    }
-                    ui.strong(&repo.name);
-                    ui.label(format!("({})", repo.source));
-                    if let Some(ref path) = repo.local_path {
-                        ui.label(format!("→ {path}"));
-                    }
-                });
-                ui.monospace(format!("   {}", repo.remote));
-            }
-        });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .max_height(ui.available_height() - 60.0)
+            .show(ui, |ui| {
+                for repo in &state.repos {
+                    ui.horizontal(|ui| {
+                        ui.label(if repo.local_path.is_some() { "✅" } else { "🔶" });
+                        ui.strong(&repo.name);
+                        ui.label(format!("({})", repo.source));
+                        if let Some(ref path) = repo.local_path {
+                            ui.label(format!("→ {path}"));
+                        }
+                    });
+                    ui.monospace(format!("   {}", repo.remote));
+                }
+            });
 
         ui.separator();
         ui.horizontal(|ui| {
-            if ui.add_enabled(!state.repos.is_empty(), egui::Button::new("📋 Generate Re-clone Script")).clicked() {
-                let mut s = String::from("#!/bin/zsh\n# Recovery script — run to re-clone projects\n# Generated by Disk Doctor\n\n");
+            if ui
+                .add_enabled(!state.repos.is_empty(), egui::Button::new("📋 Generate Re-clone Script"))
+                .clicked()
+            {
+                let mut s = String::from(
+                    "#!/bin/zsh\n# Recovery script — re-clone projects\n# Generated by Disk Doctor\n\n",
+                );
                 for repo in &state.repos {
                     s.push_str(&format!("# {} ({})\n", repo.remote, repo.source));
-                    if repo.local_path.is_some() {
-                        s.push_str(&format!("# Already at: {}\n", repo.local_path.as_ref().unwrap()));
+                    if let Some(ref path) = repo.local_path {
+                        s.push_str(&format!("# Already at: {path}\n"));
                     } else {
                         s.push_str(&format!("git clone {} {}\n", repo.remote, repo.name));
                     }
@@ -284,11 +299,8 @@ pub fn git_recovery_ui(state: &mut GitRecoveryState, ctx: &egui::Context, ui: &m
     }
 
     if state.show_script {
-        let title = if state.script.as_ref().map_or(false, |s| s.contains("photorec")) {
-            "📖 Photorec Recovery Guide"
-        } else {
-            "📋 Re-clone Script"
-        };
+        let is_photorec = state.script.as_ref().map_or(false, |s| s.contains("photorec"));
+        let title = if is_photorec { "📖 Photorec Recovery Guide" } else { "📋 Re-clone Script" };
         let content = state.script.clone().unwrap_or_default();
         let n_lines = content.lines().count() as f32;
 
@@ -307,12 +319,10 @@ pub fn git_recovery_ui(state: &mut GitRecoveryState, ctx: &egui::Context, ui: &m
                         state.show_script = false;
                         state.script = None;
                     }
-                    if !content.contains("photorec") {
-                        if ui.button("💾 Save to ~/recovery.sh").clicked() {
-                            let path = format!("{}/recovery.sh", std::env::var("HOME").unwrap_or_default());
-                            let _ = std::fs::write(&path, &content);
-                            let _ = Command::new("chmod").args(["+x", &path]).output();
-                        }
+                    if !is_photorec && ui.button("💾 Save to ~/recovery.sh").clicked() {
+                        let path = format!("{}/recovery.sh", std::env::var("HOME").unwrap_or_default());
+                        let _ = std::fs::write(&path, &content);
+                        let _ = Command::new("chmod").args(["+x", &path]).output();
                     }
                 });
             });
